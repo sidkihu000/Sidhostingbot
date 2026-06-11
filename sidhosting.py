@@ -21,6 +21,10 @@ import requests
 import hashlib
 import mimetypes
 import struct
+import importlib.util
+import asyncio
+from telethon import TelegramClient
+from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, PasswordHashInvalidError
 
 # --- Flask Keep Alive ---
 from flask import Flask
@@ -50,6 +54,9 @@ ADMIN_ID = 2119464081
 YOUR_USERNAME = '@Xricx0' 
 UPDATE_CHANNEL = 'https://t.me/+5uCnxp3U1gMwZjQ1'
 
+# 👇 PUT YOUR WEB APP URL HERE
+WEB_APP_URL = 'https://your-webapp-url.com'
+
 # Folder setup - using absolute paths
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 UPLOAD_BOTS_DIR = os.path.join(BASE_DIR, 'upload_bots')
@@ -72,10 +79,13 @@ bot = telebot.TeleBot(TOKEN)
 # --- Data structures ---
 bot_scripts = {}
 user_subscriptions = {}
+runtime_states = {}
+async_loops = {}
 user_files = {}
 active_users = set()
 admin_ids = {ADMIN_ID, OWNER_ID}
 bot_locked = False
+menu_video_id = None  # Global for dynamic menu video
 
 # --- Malware Detection Configuration ---
 MALWARE_SIGNATURES = [
@@ -118,22 +128,24 @@ logger = logging.getLogger(__name__)
 
 # --- Command Button Layouts (ReplyKeyboardMarkup) ---
 COMMAND_BUTTONS_LAYOUT_USER_SPEC = [
-    ["📢 Updates Channel"],
+    ["📢 Updates Channel", "🌐 Web App"],
     ["📤 Upload File", "📂 Check Files"],
     ["⚡ Bot Speed", "📊 Statistics"],
-    ["📤 Send Command", "📞 Contact Owner"]  # Added Send Command
+    ["📤 Send Command", "📞 Contact Owner"]
 ]
 ADMIN_COMMAND_BUTTONS_LAYOUT_USER_SPEC = [
-    ["📢 Updates Channel"],
+    ["📢 Updates Channel", "🌐 Web App"],
     ["📤 Upload File", "📂 Check Files"],
     ["⚡ Bot Speed", "📊 Statistics"],
     ["💳 Subscriptions", "📢 Broadcast"],
     ["🔒 Lock Bot", "🟢 Running All Code"],
-    ["📤 Send Command", "👑 Admin Panel"],  # Added Send Command
+    ["📤 Send Command", "👑 Admin Panel"],
     ["📞 Contact Owner"]
 ]
 
 # --- Database Setup ---
+DB_LOCK = threading.Lock() 
+
 def init_db():
     """Initialize the database with required tables"""
     logger.info(f"Initializing database at: {DATABASE_PATH}")
@@ -149,6 +161,9 @@ def init_db():
                      (user_id INTEGER PRIMARY KEY)''')
         c.execute('''CREATE TABLE IF NOT EXISTS admins
                      (user_id INTEGER PRIMARY KEY)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS bot_settings 
+                     (setting_key TEXT PRIMARY KEY, setting_value TEXT)''')
+        
         c.execute('INSERT OR IGNORE INTO admins (user_id) VALUES (?)', (OWNER_ID,))
         if ADMIN_ID != OWNER_ID:
             c.execute('INSERT OR IGNORE INTO admins (user_id) VALUES (?)', (ADMIN_ID,))
@@ -160,6 +175,7 @@ def init_db():
 
 def load_data():
     """Load data from database into memory"""
+    global menu_video_id
     logger.info("Loading data from database...")
     try:
         conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
@@ -188,10 +204,83 @@ def load_data():
         c.execute('SELECT user_id FROM admins')
         admin_ids.update(user_id for (user_id,) in c.fetchall())
 
+        # Load menu video
+        c.execute("SELECT setting_value FROM bot_settings WHERE setting_key='menu_video_id'")
+        row = c.fetchone()
+        if row: menu_video_id = row[0]
+
         conn.close()
         logger.info(f"Data loaded: {len(active_users)} users, {len(user_subscriptions)} subscriptions, {len(admin_ids)} admins.")
     except Exception as e:
         logger.error(f"❌ Error loading data: {e}", exc_info=True)
+
+def set_menu_video_db(file_id):
+    global menu_video_id
+    menu_video_id = file_id
+    with DB_LOCK:
+        try:
+            conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+            c = conn.cursor()
+            c.execute('INSERT OR REPLACE INTO bot_settings (setting_key, setting_value) VALUES (?, ?)', ('menu_video_id', file_id))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Error saving menu video DB: {e}")
+
+# --- TELETHON CORE ENGINE CORES ---
+def start_asyncio_loop(loop, coro):
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(coro)
+
+async def deploy_custom_runtime(chat_id, uid, state):
+    script_path = state["script_path"]
+    user_api_id = state["api_id"]
+    user_api_hash = state["api_hash"]
+    
+    bot.send_message(chat_id, "🛡️ **Signature Validated.** Merging userbot instance into async runtime...")
+    await state["client"].disconnect()
+    
+    old_session = f"auth_temp_{uid}.session"
+    new_session = f"user_session_{uid}"
+    
+    if os.path.exists(old_session):
+        if os.path.exists(f"{new_session}.session"): 
+            os.remove(f"{new_session}.session")
+        os.rename(old_session, new_session + ".session")
+        
+    try:
+        live_userbot = TelegramClient(new_session, int(user_api_id), user_api_hash)
+        await live_userbot.connect()
+        
+        spec = importlib.util.spec_from_file_location(f"dynamic_mod_{uid}", script_path)
+        user_module = importlib.util.module_from_spec(spec)
+        user_module.client = live_userbot 
+        spec.loader.exec_module(user_module)
+        
+        asyncio.create_task(live_userbot.start())
+        
+        success_message = f"""🚀 **DYNAMIC USERBOT RUNTIME ONLINE** 🚀
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✨ **System Status:** `RUNNING`
+📂 **Target File:** `{os.path.basename(script_path)}`
+🔐 **Session ID:** `{new_session}`
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🌟 Setup complete! Your userbot is now safely running alongside your main bot loop."""
+        bot.send_message(chat_id, success_message)
+        
+    except Exception as e:
+        bot.send_message(chat_id, f"❌ **Process Core Allocation Fault:** `{e}`")
+    
+    if uid in runtime_states: 
+        del runtime_states[uid]
+
+def extract_credentials_from_text(text):
+    api_id, api_hash = None, None
+    id_match = re.search(r'(?:API_ID)\s*=\s*[\'"]?(\d+)[\'"]?', text, re.IGNORECASE)
+    hash_match = re.search(r'(?:API_HASH)\s*=\s*[\'"]?([a-fA-Z0-9a-f]{32})[\'"]?', text, re.IGNORECASE)
+    if id_match: api_id = id_match.group(1)
+    if hash_match: api_hash = hash_match.group(1)
+    return api_id, api_hash
 
 # Initialize DB and Load Data at startup
 init_db()
@@ -199,11 +288,8 @@ load_data()
 # --- End Database Setup ---
 
 # --- Malware Detection Functions ---
-# Replace the magic import and is_suspicious_file function
-
 def get_file_type(file_content):
     """Determine file type using magic numbers and mimetypes"""
-    # Common file signatures
     signatures = {
         b'\x7fELF': 'application/x-executable',
         b'MZ': 'application/x-dosexec',
@@ -217,7 +303,6 @@ def get_file_type(file_content):
         if file_content.startswith(signature):
             return mime_type
     
-    # Fallback to extension-based detection or return unknown
     return 'application/octet-stream'
 
 def is_suspicious_file(file_content, file_name):
@@ -227,20 +312,17 @@ def is_suspicious_file(file_content, file_name):
     """
     file_lower = file_name.lower()
     
-    # Check file extensions first (same as before)
     suspicious_extensions = ['.exe', '.dll', '.bat', '.cmd', '.scr', '.com', '.pif', '.application', '.gadget',
-                            '.msi', '.msp', '.com', '.scr', '.hta', '.cpl', '.msc', '.jar', '.bin', '.deb', '.rpm',
-                            '.apk', '.app', '.dmg', '.iso', '.img']
+                             '.msi', '.msp', '.com', '.scr', '.hta', '.cpl', '.msc', '.jar', '.bin', '.deb', '.rpm',
+                             '.apk', '.app', '.dmg', '.iso', '.img']
     
     if any(file_lower.endswith(ext) for ext in suspicious_extensions):
         return True, f"Suspicious file extension: {file_name}"
     
-    # Check for malware signatures in file content
     for signature in MALWARE_SIGNATURES:
         if file_content.startswith(signature):
             return True, f"Malware signature detected: {signature}"
     
-    # Check for encrypted file indicators
     sample_size = min(len(file_content), 4096)
     file_sample = file_content[:sample_size]
     
@@ -248,13 +330,11 @@ def is_suspicious_file(file_content, file_name):
         if indicator in file_sample:
             return True, f"Encrypted file indicator: {indicator.decode('utf-8', errors='ignore')}"
     
-    # Check for suspicious keywords in first 8KB
     sample_text = file_sample.decode('utf-8', errors='ignore').lower()
     for keyword in SUSPICIOUS_KEYWORDS:
         if keyword.decode('utf-8').lower() in sample_text:
             return True, f"Suspicious keyword found: {keyword.decode('utf-8')}"
     
-    # Check file type using our custom function instead of magic
     try:
         file_type = get_file_type(file_sample)
         if file_type in ['application/x-dosexec', 'application/x-executable', 'application/x-mach-binary']:
@@ -765,8 +845,6 @@ TELEGRAM_MODULES = {
 # --- End Automatic Package Installation & Script Running ---
 
 # --- Database Operations ---
-DB_LOCK = threading.Lock() 
-
 def save_user_file(user_id, file_name, file_type='py'):
     with DB_LOCK:
         conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
@@ -876,50 +954,67 @@ def remove_admin_db(admin_id):
         finally: conn.close()
 # --- End Database Operations ---
 
+# --- UI Transition Helper ---
+def safe_edit_or_resend(call, text, reply_markup=None, parse_mode='Markdown'):
+    """Replaces text messages safely, or deletes and resends if message is a Video (which cant be text edited)"""
+    chat_id = call.message.chat.id
+    msg_id = call.message.message_id
+    if call.message.content_type != 'text':
+        try: bot.delete_message(chat_id, msg_id)
+        except: pass
+        return bot.send_message(chat_id, text, reply_markup=reply_markup, parse_mode=parse_mode)
+    else:
+        try:
+            return bot.edit_message_text(text, chat_id, msg_id, reply_markup=reply_markup, parse_mode=parse_mode)
+        except telebot.apihelper.ApiTelegramException as e:
+            if "message is not modified" in str(e): return call.message
+            raise e
+
 # --- Menu creation (Inline and ReplyKeyboards) ---
 def create_main_menu_inline(user_id):
     markup = types.InlineKeyboardMarkup(row_width=2)
-    buttons = [
-        types.InlineKeyboardButton('📢 Updates Channel', url=UPDATE_CHANNEL),
-        types.InlineKeyboardButton('📤 Upload File', callback_data='upload'),
-        types.InlineKeyboardButton('📂 Check Files', callback_data='check_files'),
-        types.InlineKeyboardButton('⚡ Bot Speed', callback_data='speed'),
-        types.InlineKeyboardButton('📤 Send Command', callback_data='send_command'),  # Added Send Command
-        types.InlineKeyboardButton('📞 Contact Owner', url=f'https://t.me/{YOUR_USERNAME.replace("@zucktmr", "@Gawdrebel")}')
-    ]
+    btn_updates = types.InlineKeyboardButton('📢 Updates Channel', url=UPDATE_CHANNEL)
+    btn_webapp = types.InlineKeyboardButton('🌐 Web App', web_app=types.WebAppInfo(url=WEB_APP_URL))
+    btn_upload = types.InlineKeyboardButton('📤 Upload File', callback_data='upload')
+    btn_check = types.InlineKeyboardButton('📂 Check Files', callback_data='check_files')
+    btn_speed = types.InlineKeyboardButton('⚡ Bot Speed', callback_data='speed')
+    btn_cmd = types.InlineKeyboardButton('📤 Send Command', callback_data='send_command')
+    btn_contact = types.InlineKeyboardButton('📞 Contact Owner', url=f'https://t.me/{YOUR_USERNAME.replace("@", "")}')
 
     if user_id in admin_ids:
         admin_buttons = [
             types.InlineKeyboardButton('💳 Subscriptions', callback_data='subscription'),
             types.InlineKeyboardButton('📊 Statistics', callback_data='stats'),
-            types.InlineKeyboardButton('🔒 Lock Bot' if not bot_locked else '🔓 Unlock Bot',
-                                     callback_data='lock_bot' if not bot_locked else 'unlock_bot'),
+            types.InlineKeyboardButton('🔒 Lock Bot' if not bot_locked else '🔓 Unlock Bot', callback_data='lock_bot' if not bot_locked else 'unlock_bot'),
             types.InlineKeyboardButton('📢 Broadcast', callback_data='broadcast'),
             types.InlineKeyboardButton('👑 Admin Panel', callback_data='admin_panel'),
             types.InlineKeyboardButton('🟢 Run All User Scripts', callback_data='run_all_scripts')
         ]
-        markup.add(buttons[0])
-        markup.add(buttons[1], buttons[2])
-        markup.add(buttons[3], admin_buttons[0])
-        markup.add(admin_buttons[1], admin_buttons[3])
+        markup.add(btn_updates, btn_webapp)
+        markup.add(btn_upload, btn_check)
+        markup.add(btn_speed, admin_buttons[1])
+        markup.add(admin_buttons[0], admin_buttons[3])
         markup.add(admin_buttons[2], admin_buttons[5])
-        markup.add(buttons[4])  # Send Command
-        markup.add(admin_buttons[4])
-        markup.add(buttons[5])
+        markup.add(btn_cmd, admin_buttons[4])
+        markup.add(btn_contact)
     else:
-        markup.add(buttons[0])
-        markup.add(buttons[1], buttons[2])
-        markup.add(buttons[3])
-        markup.add(buttons[4])  # Send Command
-        markup.add(types.InlineKeyboardButton('📊 Statistics', callback_data='stats'))
-        markup.add(buttons[5])
+        markup.add(btn_updates, btn_webapp)
+        markup.add(btn_upload, btn_check)
+        markup.add(btn_speed, types.InlineKeyboardButton('📊 Statistics', callback_data='stats'))
+        markup.add(btn_cmd, btn_contact)
     return markup
 
 def create_reply_keyboard_main_menu(user_id):
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     layout_to_use = ADMIN_COMMAND_BUTTONS_LAYOUT_USER_SPEC if user_id in admin_ids else COMMAND_BUTTONS_LAYOUT_USER_SPEC
     for row_buttons_text in layout_to_use:
-        markup.add(*[types.KeyboardButton(text) for text in row_buttons_text])
+        row_btns = []
+        for text in row_buttons_text:
+            if text == "🌐 Web App":
+                row_btns.append(types.KeyboardButton(text, web_app=types.WebAppInfo(url=WEB_APP_URL)))
+            else:
+                row_btns.append(types.KeyboardButton(text))
+        markup.add(*row_btns)
     return markup
 
 def create_control_buttons(script_owner_id, file_name, is_running=True):
@@ -950,7 +1045,10 @@ def create_admin_panel():
         types.InlineKeyboardButton('➕ Add Admin', callback_data='add_admin'),
         types.InlineKeyboardButton('➖ Remove Admin', callback_data='remove_admin')
     )
-    markup.row(types.InlineKeyboardButton('📋 List Admins', callback_data='list_admins'))
+    markup.row(
+        types.InlineKeyboardButton('📋 List Admins', callback_data='list_admins'),
+        types.InlineKeyboardButton('📹 Set Menu Video', callback_data='set_menu_video')
+    )
     markup.row(types.InlineKeyboardButton('🔙 Back to Main', callback_data='back_to_main'))
     return markup
 
@@ -1132,6 +1230,7 @@ def handle_zip_file(downloaded_file_content, file_name_zip, message):
         if temp_dir and os.path.exists(temp_dir):
             try: shutil.rmtree(temp_dir); logger.info(f"Cleaned temp dir: {temp_dir}")
             except Exception as e: logger.error(f"Failed to clean temp dir {temp_dir}: {e}", exc_info=True)
+
 def handle_js_file(file_path, script_owner_id, user_folder, file_name, message):
     try:
         save_user_file(script_owner_id, file_name, 'js')
@@ -1307,10 +1406,30 @@ def _logic_send_welcome(message):
                         f"🤖 Host & run Python (`.py`) or JS (`.js`) scripts.\n"
                         f"   Upload single scripts or `.zip` archives.\n\n"
                         f"👇 Use buttons or type commands.")
+                        
     main_reply_markup = create_reply_keyboard_main_menu(user_id)
+    inline_markup = create_main_menu_inline(user_id)
+
     try:
+        # Send Photo if extracted
         if photo_file_id: bot.send_photo(chat_id, photo_file_id)
-        bot.send_message(chat_id, welcome_msg_text, reply_markup=main_reply_markup, parse_mode='Markdown')
+        
+        # If Admin setup a Menu Video, send it with the Inline Menu attached!
+        if menu_video_id:
+            try:
+                bot.send_video(chat_id, menu_video_id, caption=welcome_msg_text, reply_markup=inline_markup, parse_mode='Markdown')
+                bot.send_message(chat_id, "Navigating via Reply Keyboard:", reply_markup=main_reply_markup)
+            except telebot.apihelper.ApiTelegramException:
+                try: 
+                    bot.send_animation(chat_id, menu_video_id, caption=welcome_msg_text, reply_markup=inline_markup, parse_mode='Markdown')
+                    bot.send_message(chat_id, "Navigating via Reply Keyboard:", reply_markup=main_reply_markup)
+                except:
+                    bot.send_message(chat_id, welcome_msg_text, reply_markup=main_reply_markup, parse_mode='Markdown')
+                    bot.send_message(chat_id, "Navigation Menu:", reply_markup=inline_markup)
+        else:
+            bot.send_message(chat_id, welcome_msg_text, reply_markup=main_reply_markup, parse_mode='Markdown')
+            bot.send_message(chat_id, "Navigation Menu:", reply_markup=inline_markup)
+            
     except Exception as e:
         logger.error(f"Error sending welcome to {user_id}: {e}", exc_info=True)
         try: bot.send_message(chat_id, welcome_msg_text, reply_markup=main_reply_markup, parse_mode='Markdown')
@@ -1518,7 +1637,7 @@ BUTTON_TEXT_TO_LOGIC = {
     "📤 Upload File": _logic_upload_file,
     "📂 Check Files": _logic_check_files,
     "⚡ Bot Speed": _logic_bot_speed,
-    "📤 Send Command": _logic_send_command,  # Added Send Command
+    "📤 Send Command": _logic_send_command, 
     "📞 Contact Owner": _logic_contact_owner,
     "📊 Statistics": _logic_statistics,
     "💳 Subscriptions": _logic_subscriptions_panel,
@@ -1542,7 +1661,7 @@ def command_upload_file(message): _logic_upload_file(message)
 def command_check_files(message): _logic_check_files(message)
 @bot.message_handler(commands=['botspeed'])
 def command_bot_speed(message): _logic_bot_speed(message)
-@bot.message_handler(commands=['sendcommand'])  # Added Send Command
+@bot.message_handler(commands=['sendcommand'])  
 def command_send_command(message): _logic_send_command(message)
 @bot.message_handler(commands=['contactowner'])
 def command_contact_owner(message): _logic_contact_owner(message)
@@ -1656,7 +1775,6 @@ def handle_callbacks(call):
         elif data == 'back_to_main': back_to_main_callback(call)
         elif data.startswith('confirm_broadcast_'): handle_confirm_broadcast(call)
         elif data == 'cancel_broadcast': handle_cancel_broadcast(call)
-        # --- New Send Command Callbacks ---
         elif data == 'send_command': send_command_callback(call)
         elif data == 'send_to_process': send_to_process_callback(call)
         elif data.startswith('sendcmd_select_'): sendcmd_select_callback(call)
@@ -1676,6 +1794,7 @@ def handle_callbacks(call):
         elif data == 'add_subscription': admin_required_callback(call, add_subscription_init_callback) 
         elif data == 'remove_subscription': admin_required_callback(call, remove_subscription_init_callback) 
         elif data == 'check_subscription': admin_required_callback(call, check_subscription_init_callback) 
+        elif data == 'set_menu_video': admin_required_callback(call, set_menu_video_init_callback)
         else:
             bot.answer_callback_query(call.id, "Unknown action.")
             logger.warning(f"Unhandled callback data: {data} from user {user_id}")
@@ -1696,13 +1815,34 @@ def owner_required_callback(call, func_to_run):
         return
     func_to_run(call)
 
-# --- New Send Command Callback Functions ---
+# --- New Callback Functions ---
+def set_menu_video_init_callback(call):
+    bot.answer_callback_query(call.id)
+    msg = bot.send_message(call.message.chat.id, "📹 Please send the Video or GIF you want to use for the main menu.\nSend /cancel to abort.")
+    bot.register_next_step_handler(msg, process_set_menu_video)
+
+def process_set_menu_video(message):
+    if message.text and message.text.lower() == '/cancel':
+        bot.reply_to(message, "Set menu video cancelled.")
+        return
+    
+    file_id = None
+    if message.video: file_id = message.video.file_id
+    elif message.animation: file_id = message.animation.file_id
+    elif message.document and message.document.mime_type and message.document.mime_type.startswith('video/'):
+        file_id = message.document.file_id
+        
+    if file_id:
+        set_menu_video_db(file_id)
+        bot.reply_to(message, "✅ Menu video updated successfully! Use /start to test it.")
+    else:
+        msg = bot.reply_to(message, "⚠️ No valid video found. Please send a Video or GIF, or /cancel.")
+        bot.register_next_step_handler(msg, process_set_menu_video)
+
 def send_command_callback(call):
     bot.answer_callback_query(call.id)
     try:
-        bot.edit_message_text("📤 Send Command Options:",
-                              call.message.chat.id, call.message.message_id, 
-                              reply_markup=create_send_command_menu())
+        safe_edit_or_resend(call, "📤 Send Command Options:", reply_markup=create_send_command_menu())
     except Exception as e:
         logger.error(f"Error showing send command menu: {e}")
 
@@ -1749,8 +1889,6 @@ def viewlog_callback(call):
         logger.error(f"Error in viewlog_callback: {e}")
         bot.answer_callback_query(call.id, "Error viewing log.")
 
-# ... (rest of the existing callback functions remain the same)
-
 def upload_callback(call):
     user_id = call.from_user.id
     file_limit = get_user_file_limit(user_id)
@@ -1764,17 +1902,13 @@ def upload_callback(call):
 
 def check_files_callback(call):
     user_id = call.from_user.id
-    chat_id = call.message.chat.id 
     user_files_list = user_files.get(user_id, [])
-    if not user_files_list:
-        bot.answer_callback_query(call.id, "⚠️ No files uploaded.", show_alert=True)
-        try:
-            markup = types.InlineKeyboardMarkup()
-            markup.add(types.InlineKeyboardButton("🔙 Back to Main", callback_data='back_to_main'))
-            bot.edit_message_text("📂 Your files:\n\n(No files uploaded)", chat_id, call.message.message_id, reply_markup=markup)
-        except Exception as e: logger.error(f"Error editing msg for empty file list: {e}")
-        return
     bot.answer_callback_query(call.id) 
+    if not user_files_list:
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("🔙 Back to Main", callback_data='back_to_main'))
+        safe_edit_or_resend(call, "📂 Your files:\n\n(No files uploaded)", reply_markup=markup)
+        return
     markup = types.InlineKeyboardMarkup(row_width=1) 
     for file_name, file_type in sorted(user_files_list): 
         is_running = is_bot_running(user_id, file_name)
@@ -1782,12 +1916,7 @@ def check_files_callback(call):
         btn_text = f"{file_name} ({file_type}) - {status_icon}"
         markup.add(types.InlineKeyboardButton(btn_text, callback_data=f'file_{user_id}_{file_name}'))
     markup.add(types.InlineKeyboardButton("🔙 Back to Main", callback_data='back_to_main'))
-    try:
-        bot.edit_message_text("📂 Your files:\nClick to manage.", chat_id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
-    except telebot.apihelper.ApiTelegramException as e:
-         if "message is not modified" in str(e): logger.warning("Msg not modified (files).")
-         else: logger.error(f"Error editing msg for file list: {e}")
-    except Exception as e: logger.error(f"Unexpected error editing msg for file list: {e}", exc_info=True)
+    safe_edit_or_resend(call, "📂 Your files:\nClick to manage.", reply_markup=markup)
 
 def file_control_callback(call):
     try:
@@ -1812,16 +1941,12 @@ def file_control_callback(call):
         is_running = is_bot_running(script_owner_id, file_name)
         status_text = '🟢 Running' if is_running else '🔴 Stopped'
         file_type = next((f[1] for f in user_files_list if f[0] == file_name), '?') 
-        try:
-            bot.edit_message_text(
-                f"⚙️ Controls for: `{file_name}` ({file_type}) of User `{script_owner_id}`\nStatus: {status_text}",
-                call.message.chat.id, call.message.message_id,
-                reply_markup=create_control_buttons(script_owner_id, file_name, is_running),
-                parse_mode='Markdown'
-            )
-        except telebot.apihelper.ApiTelegramException as e:
-             if "message is not modified" in str(e): logger.warning(f"Msg not modified (controls for {file_name})")
-             else: raise 
+        
+        safe_edit_or_resend(
+            call,
+            f"⚙️ Controls for: `{file_name}` ({file_type}) of User `{script_owner_id}`\nStatus: {status_text}",
+            reply_markup=create_control_buttons(script_owner_id, file_name, is_running)
+        )
     except (ValueError, IndexError) as ve:
         logger.error(f"Error parsing file control callback: {ve}. Data: '{call.data}'")
         bot.answer_callback_query(call.id, "Error: Invalid action data.", show_alert=True)
@@ -2113,64 +2238,60 @@ def logs_bot_callback(call):
         bot.answer_callback_query(call.id, "Error fetching logs.", show_alert=True)
 
 def speed_callback(call):
-    user_id = call.from_user.id
     chat_id = call.message.chat.id
     start_cb_ping_time = time.time() 
-    try:
+    bot.answer_callback_query(call.id)
+    
+    if call.message.content_type != 'text':
+        try: bot.delete_message(chat_id, call.message.message_id)
+        except: pass
+        msg = bot.send_message(chat_id, "🏃 Testing speed...")
+        msg_id = msg.message_id
+    else:
         bot.edit_message_text("🏃 Testing speed...", chat_id, call.message.message_id)
-        bot.send_chat_action(chat_id, 'typing') 
-        response_time = round((time.time() - start_cb_ping_time) * 1000, 2)
-        status = "🔓 Unlocked" if not bot_locked else "🔒 Locked"
-        if user_id == OWNER_ID: user_level = "👑 Owner"
-        elif user_id in admin_ids: user_level = "🛡️ Admin"
-        elif user_id in user_subscriptions and user_subscriptions[user_id].get('expiry', datetime.min) > datetime.now(): user_level = "⭐ Premium"
-        else: user_level = "🆓 Free User"
-        speed_msg = (f"⚡ Bot Speed & Status:\n\n⏱️ API Response Time: {response_time} ms\n"
-                     f"🚦 Bot Status: {status}\n"
-                     f"👤 Your Level: {user_level}")
-        bot.answer_callback_query(call.id) 
-        bot.edit_message_text(speed_msg, chat_id, call.message.message_id, reply_markup=create_main_menu_inline(user_id))
-    except Exception as e:
-         logger.error(f"Error during speed test (cb): {e}", exc_info=True)
-         bot.answer_callback_query(call.id, "Error in speed test.", show_alert=True)
-         try: bot.edit_message_text("〽️ Main Menu", chat_id, call.message.message_id, reply_markup=create_main_menu_inline(user_id))
-         except Exception: pass
+        msg_id = call.message.message_id
+
+    bot.send_chat_action(chat_id, 'typing') 
+    response_time = round((time.time() - start_cb_ping_time) * 1000, 2)
+    status = "🔓 Unlocked" if not bot_locked else "🔒 Locked"
+    user_id = call.from_user.id
+    if user_id == OWNER_ID: user_level = "👑 Owner"
+    elif user_id in admin_ids: user_level = "🛡️ Admin"
+    elif user_id in user_subscriptions and user_subscriptions[user_id].get('expiry', datetime.min) > datetime.now(): user_level = "⭐ Premium"
+    else: user_level = "🆓 Free User"
+    
+    speed_msg = (f"⚡ Bot Speed & Status:\n\n⏱️ API Response Time: {response_time} ms\n"
+                 f"🚦 Bot Status: {status}\n"
+                 f"👤 Your Level: {user_level}")
+    
+    bot.edit_message_text(speed_msg, chat_id, msg_id, reply_markup=create_main_menu_inline(user_id))
 
 def back_to_main_callback(call):
     user_id = call.from_user.id
     chat_id = call.message.chat.id
+    bot.answer_callback_query(call.id)
+    
     file_limit = get_user_file_limit(user_id)
     current_files = get_user_file_count(user_id)
     limit_str = str(file_limit) if file_limit != float('inf') else "Unlimited"
-    expiry_info = ""
-    if user_id == OWNER_ID: user_status = "👑 Owner"
-    elif user_id in admin_ids: user_status = "🛡️ Admin"
-    elif user_id in user_subscriptions:
-        expiry_date = user_subscriptions[user_id].get('expiry')
-        if expiry_date and expiry_date > datetime.now():
-            user_status = "⭐ Premium"; days_left = (expiry_date - datetime.now()).days
-            expiry_info = f"\n⏳ Subscription expires in: {days_left} days"
-        else: user_status = "🆓 Free User (Expired Sub)"
-    else: user_status = "🆓 Free User"
+    
     main_menu_text = (f"〽️ Welcome back, {call.from_user.first_name}!\n\n🆔 ID: `{user_id}`\n"
-                      f"🔰 Status: {user_status}{expiry_info}\n📁 Files: {current_files} / {limit_str}\n\n"
-                      f"👇 Use buttons or type commands.")
+                      f"📁 Files: {current_files} / {limit_str}\n👇 Use buttons or commands.")
+    
     try:
-        bot.answer_callback_query(call.id)
-        bot.edit_message_text(main_menu_text, chat_id, call.message.message_id,
-                              reply_markup=create_main_menu_inline(user_id), parse_mode='Markdown')
-    except telebot.apihelper.ApiTelegramException as e:
-         if "message is not modified" in str(e): logger.warning("Msg not modified (back_to_main).")
-         else: logger.error(f"API error on back_to_main: {e}")
-    except Exception as e: logger.error(f"Error handling back_to_main: {e}", exc_info=True)
+        if menu_video_id:
+            try: bot.delete_message(chat_id, call.message.message_id)
+            except: pass
+            try: bot.send_video(chat_id, menu_video_id, caption=main_menu_text, reply_markup=create_main_menu_inline(user_id), parse_mode='Markdown')
+            except: bot.send_animation(chat_id, menu_video_id, caption=main_menu_text, reply_markup=create_main_menu_inline(user_id), parse_mode='Markdown')
+        else:
+            safe_edit_or_resend(call, main_menu_text, reply_markup=create_main_menu_inline(user_id))
+    except Exception as e: logger.error(f"Error handling back_to_main: {e}")
 
 # --- Admin Callback Implementations ---
 def subscription_management_callback(call):
     bot.answer_callback_query(call.id)
-    try:
-        bot.edit_message_text("💳 Subscription Management\nSelect action:",
-                              call.message.chat.id, call.message.message_id, reply_markup=create_subscription_menu())
-    except Exception as e: logger.error(f"Error showing sub menu: {e}")
+    safe_edit_or_resend(call, "💳 Subscription Management\nSelect action:", reply_markup=create_subscription_menu())
 
 def stats_callback(call):
     bot.answer_callback_query(call.id)
@@ -2316,10 +2437,7 @@ def execute_broadcast(broadcast_text, photo_id, video_id, caption, admin_chat_id
 
 def admin_panel_callback(call):
     bot.answer_callback_query(call.id)
-    try:
-        bot.edit_message_text("👑 Admin Panel\nManage admins (Owner actions may be restricted).",
-                              call.message.chat.id, call.message.message_id, reply_markup=create_admin_panel())
-    except Exception as e: logger.error(f"Error showing admin panel: {e}")
+    safe_edit_or_resend(call, "👑 Admin Panel\nManage admins (Owner actions may be restricted).", reply_markup=create_admin_panel())
 
 def add_admin_init_callback(call):
     bot.answer_callback_query(call.id)
@@ -2377,8 +2495,7 @@ def list_admins_callback(call):
     try:
         admin_list_str = "\n".join(f"- `{aid}` {'(Owner)' if aid == OWNER_ID else ''}" for aid in sorted(list(admin_ids)))
         if not admin_list_str: admin_list_str = "(No Owner/Admins configured!)"
-        bot.edit_message_text(f"👑 Current Admins:\n\n{admin_list_str}", call.message.chat.id,
-                              call.message.message_id, reply_markup=create_admin_panel(), parse_mode='Markdown')
+        safe_edit_or_resend(call, f"👑 Current Admins:\n\n{admin_list_str}", reply_markup=create_admin_panel())
     except Exception as e: logger.error(f"Error listing admins: {e}")
 
 def add_subscription_init_callback(call):
