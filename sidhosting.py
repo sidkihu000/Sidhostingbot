@@ -1556,6 +1556,10 @@ def _logic_admin_panel(message):
                  reply_markup=create_admin_panel())
 
 def _logic_run_all_scripts(message_or_call):
+    # Wrapped this in a thread to prevent blocking the main polling loop!
+    threading.Thread(target=_run_all_scripts_worker, args=(message_or_call,)).start()
+
+def _run_all_scripts_worker(message_or_call):
     if isinstance(message_or_call, telebot.types.Message):
         admin_user_id = message_or_call.from_user.id
         admin_chat_id = message_or_call.chat.id
@@ -2683,10 +2687,17 @@ if __name__ == '__main__':
     logger.info("🚀 Starting polling...")
     while True:
         try:
-            bot.infinity_polling(logger_level=logging.INFO, timeout=60, long_polling_timeout=30)
-        except requests.exceptions.ReadTimeout: logger.warning("Polling ReadTimeout. Restarting in 5s..."); time.sleep(5)
-        except requests.exceptions.ConnectionError as ce: logger.error(f"Polling ConnectionError: {ce}. Retrying in 15s..."); time.sleep(15)
+            bot.polling(none_stop=True, skip_pending=True, timeout=60, long_polling_timeout=60)
+        except requests.exceptions.ReadTimeout: 
+            logger.warning("Polling ReadTimeout. Restarting in 5s...")
+            time.sleep(5)
+        except requests.exceptions.ConnectionError as ce: 
+            logger.error(f"Polling ConnectionError: {ce}. Retrying in 15s...")
+            time.sleep(15)
         except Exception as e:
             logger.critical(f"💥 Unrecoverable polling error: {e}", exc_info=True)
-            logger.info("Restarting polling in 30s due to critical error..."); time.sleep(30)
-        finally: logger.warning("Polling attempt finished. Will restart if in loop."); time.sleep(1)
+            logger.info("Restarting polling in 30s due to critical error...")
+            time.sleep(30)
+        finally: 
+            logger.warning("Polling attempt finished. Will restart if in loop.")
+            time.sleep(1)
