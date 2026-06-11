@@ -23,6 +23,7 @@ import mimetypes
 import struct
 import importlib.util
 import asyncio
+import uuid  # <-- Added for Secret Key Generation
 from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, PasswordHashInvalidError
 
@@ -48,7 +49,7 @@ def keep_alive():
 # --- End Flask Keep Alive ---
 
 # --- Configuration ---
-TOKEN = '6248614957:AAGII_pN7RJiz6xxuTV-4zf9KGt2_s6ncYU' 
+TOKEN = '6248614957:AAGWzd37KASqv6u3OZRxt3gPaqkkdpmRNHg' 
 OWNER_ID = 2119464081
 ADMIN_ID = 2119464081
 YOUR_USERNAME = '@Xricx0' 
@@ -1624,6 +1625,84 @@ def _logic_run_all_scripts(message_or_call):
 
     reply_func(summary_msg, parse_mode='Markdown')
     logger.info(f"Run all scripts finished. Admin: {admin_user_id}. Started: {started_count}. Skipped/Errors: {skipped_files}")
+
+# --- NEW: SECRET KEY ACCESS CONTROL ---
+authorized_users_cache = set()
+_auth_loaded = False
+
+def load_auth_data():
+    global _auth_loaded
+    if _auth_loaded: return
+    try:
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        c = conn.cursor()
+        c.execute("SELECT setting_key FROM bot_settings WHERE setting_key LIKE 'auth_user_%'")
+        for row in c.fetchall():
+            user_id = int(row[0].split('_')[-1])
+            authorized_users_cache.add(user_id)
+        conn.close()
+        _auth_loaded = True
+    except Exception as e:
+        logger.error(f"Error loading auth data: {e}")
+
+def is_user_authorized(user_id):
+    load_auth_data()
+    if user_id in admin_ids or user_id == OWNER_ID:
+        return True
+    return user_id in authorized_users_cache
+
+# 1. Admin Command to Generate Keys
+@bot.message_handler(commands=['genkey'])
+def generate_secret_key(message):
+    if message.from_user.id not in admin_ids:
+        return
+    new_key = f"KEY-{uuid.uuid4().hex[:8].upper()}"
+    try:
+        with DB_LOCK:
+            conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+            c = conn.cursor()
+            c.execute("INSERT OR REPLACE INTO bot_settings (setting_key, setting_value) VALUES (?, ?)", (f'secret_key_{new_key}', 'valid'))
+            conn.commit()
+            conn.close()
+        bot.reply_to(message, f"✅ **New Secret Key Generated:**\n`{new_key}`\n\nSend this key to a user to grant them access. It is valid for one use.", parse_mode='Markdown')
+    except Exception as e:
+        bot.reply_to(message, f"❌ Error generating key: {e}")
+
+# 2. Intercept unauthorized users
+@bot.message_handler(func=lambda message: not is_user_authorized(message.from_user.id))
+def enforce_secret_key(message):
+    user_id = message.from_user.id
+    text = message.text.strip() if message.text else ""
+    
+    try:
+        with DB_LOCK:
+            conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+            c = conn.cursor()
+            c.execute("SELECT setting_value FROM bot_settings WHERE setting_key = ?", (f'secret_key_{text}',))
+            row = c.fetchone()
+            
+            if row:
+                # Delete key to make it single-use
+                c.execute("DELETE FROM bot_settings WHERE setting_key = ?", (f'secret_key_{text}',))
+                c.execute("INSERT OR REPLACE INTO bot_settings (setting_key, setting_value) VALUES (?, ?)", (f'auth_user_{user_id}', 'true'))
+                conn.commit()
+                conn.close()
+                
+                authorized_users_cache.add(user_id)
+                bot.reply_to(message, "✅ **Access Granted!** Secret key accepted.", parse_mode='Markdown')
+                _logic_send_welcome(message) 
+            else:
+                conn.close()
+                bot.reply_to(message, "🔒 **Bot Locked**\n\nYou must enter a valid secret key to use this bot.\nPlease send your secret key below:", parse_mode='Markdown')
+    except Exception as e:
+        logger.error(f"Error checking secret key: {e}")
+        bot.reply_to(message, "❌ Error verifying key. Please try again later.")
+
+# 3. Intercept callbacks for unauthorized users
+@bot.callback_query_handler(func=lambda call: not is_user_authorized(call.from_user.id))
+def enforce_secret_key_callback(call):
+    bot.answer_callback_query(call.id, "🔒 Access Denied. Please send your secret key in the chat.", show_alert=True)
+# --- END SECRET KEY ACCESS CONTROL ---
 
 # --- Command Handlers & Text Handlers for ReplyKeyboard ---
 @bot.message_handler(commands=['start', 'help'])
