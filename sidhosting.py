@@ -49,7 +49,7 @@ def keep_alive():
 # --- End Flask Keep Alive ---
 
 # --- Configuration ---
-TOKEN = '6248614957:AAGII_pN7RJiz6xxuTV-4zf9KGt2_s6ncYU' 
+TOKEN = '8032494974:AAE3s6Uh0c-KdWsXDd5ZP_R6h6KixSUt-dw' 
 OWNER_ID = 2119464081
 ADMIN_ID = 2119464081
 YOUR_USERNAME = '@Xricx0' 
